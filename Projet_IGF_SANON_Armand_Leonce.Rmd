@@ -1,0 +1,507 @@
+---
+title: "Project IGF10 "
+output: 
+  html_document:
+    toc: true
+date: "2025-03-03"
+---
+
+Vous devrez répondre aux questions avec des lignes de codes
+
+# Introduction
+
+1.  design experimental
+
+1.a. Contexte biologique
+Nous avons comparé deux populations cellulaires issues d’embryons de 2 types de souris : des cellules issues de souris WT (sauvages) et des cellules issues de souris mutantes Knock Out par le système cre-lox (expression de Cre ayant délété le gène cible flanqué de sites Loxp). Pour caractériser l’impact transcriptionnel de cette délétion, nous avons quantifié par RT‑qPCR l’expression de 24 gènes représentatifs des trois feuillets embryonnaires (endoderme, mésoderme, ectoderme) ainsi que des marqueurs de la pluripotence.
+
+1.b.Conditions expérimentales 
+Chaque condition (WT et KO) comprenait trois (03) réplicats biologiques et trois(03) réplicats techniques. Les valeurs médianes et moyennes de Ct de la RT-qPCR ont été d'abord normalisées sur un gène de ménage, transformées en dCT,  puis ensuite en ddCt  pour calculer leurs variations d’expression relatives qui est le Fold change. Une analyse en composantes principales (PCA) a été réalisée sur les profils d’expression relatifs afin de visualiser la séparation globale entre WT et KO pour identifier le gène dont l’expression est la plus affectée par la recombinaison Cre‑Lox. Enfin, Une RNA‑seq nous permettra d'identifier quels gènes changent d’expression entre les differentes conditions, et l’analyse Gene Ontology (GO) traduit ces listes de gènes en fonctions biologiques, composants cellulaires et activités moléculaires pour étayer nos hypothèses biologiques.
+
+
+install.packages("magick")  
+```{r}
+library(magick)
+img <- image_read("cre_lox.png")
+print(img, info = FALSE)    
+
+```
+
+2.  question scientifique
+La question scientifique ici posée est : Comment la délétion Cre‑Lox d’un gène cible influence‑t‑elle l’expression des gènes de différenciation embryonnaire (endoderme, mésoderme, ectoderme, pluripotence) dans des cellules embryonnaires de souris ?
+
+# Analyses des données de RT-qPCR
+
+## Charger les packages
+
+```{r}
+library(tidyverse)
+library(ggpubr)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+library(BiocManager)
+BiocManager::install("DESeq2")
+BiocManager::install("ComplexHeatmap")
+BiocManager::install("goseq")
+BiocManager::install("clusterProfiler")
+BiocManager::install("org.Mm.eg.db")
+
+```
+
+## Charger les données
+
+```{r}
+qpcr_dat<-read_excel("Data10.xlsx")
+```
+
+Le tableau doit ressembler à cela (attention les valeurs seront différentes): ![Caption](pics/1_readcsv.png)
+
+*Question 1.1: combien de gènes ont été analysés?*
+
+```{r}
+qpcr_dat|>
+  distinct(Gene)|>
+  nrow()
+```
+
+*Question 1.2: Combien d'échantillons ont été analysés?*
+
+```{r}
+ncol(qpcr_dat)-1
+```
+
+*Question 1.3: Combien de réplicats techniques sont effectué pas échantillons pour chaque gène*
+
+```{r}
+table(qpcr_dat$Gene)
+```
+
+## Transformer le tableau pour avoir une seul colonne d'expression de gène
+
+```{r}
+qpcr_dat_long<-pivot_longer(qpcr_dat,cols=2:7,names_to="Sample",values_to="Ct")
+
+head(qpcr_dat_long)
+```
+
+Le tableau doit ressembler à cela: ![Caption](pics/2_pivotlonger.png)
+
+*Question 2: quelles sont les nouvelles dimensions de ce tableau?*
+
+```{r}
+dim(qpcr_dat_long)
+```
+
+## Ajouter des métadatas sur le tableau principale
+
+Une métadata est une information sur l'échantillon qui sera importante plus tard pour filtrer les données
+
+### Ouvrir le tableau de fonction des gènes
+
+```{r}
+meta<-read.table("fonction_gène.txt","\t",h=T)
+```
+
+*Question 3: quelles sont les différentes catégories de gènes?*
+
+```{r}
+unique(meta$Fonction)
+```
+
+### Ajouter les metadata sur le tableau principal
+
+```{r}
+qpcr_combined<-merge(qpcr_dat_long,meta,by="Gene")
+```
+
+Le tableau doit ressembler à cela: ![Caption](pics/3_meta1.png)
+
+### Créer deux colonnes à partir de la colonne Sample
+
+L'obejctif est de séparer la chaîne de caractère contenue dans "Sample" en deux colonnes que l'on pourra appeler "CellType" et "BioRep". Ajouter ces deux colonnes dans le tableau principal.
+
+Indice: utilisez la fonction **str_split_fixed()**
+
+```{r}
+str_split<-str_split_fixed(qpcr_combined$Sample,"_", n=2)
+colnames(str_split)<-c("CellType","BioRep")
+head(str_split)
+qpcr_combined_split<-cbind.data.frame(qpcr_combined,str_split)
+```
+
+Le tableau doit ressembler à cela: ![Caption](pics/4_meta2.png)
+
+## Calcul du 2\^-ddct
+
+### calculer les médianes des réplicats techniques
+
+Pensez à éliminer la colonne Ct et ensuite les valeurs redondante après le calcul des médianes et si vous groupez pensez à dégrouper à la fin de votre code.
+
+```{r}
+qpcr_median<-qpcr_combined_split|>
+  group_by(Gene,Sample)|>
+  mutate("Med_Ct"=median(Ct))|>
+  distinct(Gene,.keep_all = T)|>
+  ungroup()
+head(qpcr_median)
+   
+
+```
+
+*Question 4: quelles sont les dimensions de cette nouvelle table?*
+
+```{r}
+dim(qpcr_median)
+```
+
+### caluler les dCt
+
+#### extraire les valeur de Ct du gène de ménage
+
+```{r}
+data_GDM<-qpcr_median|>
+  filter(Fonction=="GDM")
+
+```
+
+#### verifier l'expression du GDM
+
+plotter les valeurs de Ct afin d'observer si les gènes de ménages sont comparable. Si possible ajouter une analyse statistique avec la fonction **stat_compare_means()**
+
+```{r}
+ggplot(data_GDM,aes(x=CellType,y=Med_Ct,fill = CellType))+geom_boxplot()+geom_jitter(width=0.2)+
+  ylim(c(20,25))+
+  stat_compare_means()+theme_classic2()
+```
+
+voici un résultat possible: ![Caption](pics/5_GDM.png)
+
+*Question 5: que pouvez vous conclure des Ct entre WT et KO?*
+
+#### Ajouter les medianes des Ct du GDM pour chaque échantillon
+
+indice: pour le dataframe du GDM ne garder que les colonnes "Sample" et "MedCt"
+
+```{r}
+data_GDM_small<-data_GDM|>
+  select(Sample,Med_Ct)
+colnames(data_GDM_small)<-c("Sample","Med_Ct_GDM")
+qpcr_GDM_long<-qpcr_median|>
+  merge(y=data_GDM_small,by="Sample")
+head(qpcr_GDM_long)
+```
+
+#### calculer les dCt
+
+```{r}
+qpcr_dCt<-qpcr_GDM_long|>
+  mutate(dCt=Med_Ct-Med_Ct_GDM)
+
+```
+
+Le tableau doit ressembler à cela: ![Caption](pics/6_dCt.png)
+
+### PCA
+
+#### Créer une table avec seulement Gene, Sample et dCt
+
+```{r}
+qpcr_dCt_split<-qpcr_dCt|>
+  select(Gene,Sample,dCt)
+```
+
+#### transformer le tableau pour avoir les échantillon en colonne et les gènes en ligne
+
+```{r}
+qpcr_dCt_wide<-qpcr_dCt_split|>
+  pivot_wider(names_from ="Sample",values_from ="dCt")
+head(qpcr_dCt_wide)
+```
+
+Le tableau doit ressembler à cela: ![Caption](pics/7_pivotwider.png)
+
+#### faire la PCA
+
+indice: utiliser la fonction **prcomp()** attention à ne prendre que les valeurs numérique
+
+```{r}
+PCA_data<-prcomp(qpcr_dCt_wide[,2:ncol(qpcr_dCt_wide)])
+head(PCA_data)
+PCA_coord<-as.data.frame(PCA_data$rotation)
+class(PCA_coord)
+PCA_coord_small<-PCA_coord|>
+  select(PC1,PC2)
+PCA_coord_small$Sample<-rownames(PCA_coord_small)
+PCA_data$sdev
+```
+
+*Question 6.1: Observez l'objet créer. Où sont les nouvelles coordonnées des 6 échantillons dans le nouveau repère calculé par la PCA?*
+
+*Question 6.2: Où sont les nouvelles variances représentées par chaque PC?*
+
+#### plotter la PCA
+
+plottez seulement PC1 et PC2
+
+```{r}
+ggscatter(PCA_coord,x="PC1",y="PC2")
+```
+
+```{r}
+```
+
+Un graphique possible: ![Caption](pics/8_PCA.png)
+
+#### plotter le elbow plot
+
+grâce au valeure de variance *sdev* il est possible de caluler un pourcentage de variance et de plotter chaque PC contre la variance. Ce plot aura pour géométrie une ligne
+
+```{r}
+qpcr_variance<-(PCA_data$sdev/sum(PCA_data$sdev))*100
+elbow_data<-cbind.data.frame(1:6, qpcr_variance)
+colnames(elbow_data)<-c("PC","var")
+ggplot(elbow_data,aes(x=PC,y=var))+
+  geom_line(color="blue")+
+  geom_point(color="red")+
+  theme_classic()
+```
+Un graphique possible: ![Caption](pics/9_elbow.png)
+
+### calculer les 2ddCt ou Fold change
+
+#### extraire les échanillons WT qui vont nous servir de contrôle
+
+```{r}
+qpcr_dCt_Wt<-qpcr_dCt|>filter(CellType=="WT")
+```
+
+#### calculer la moyenne des réplicats biologique pour chaque gene
+
+```{r}
+qpcr_dCt_Wt_mean<-qpcr_dCt_Wt|>
+  group_by(Gene)|>
+  summarise("Mean_Ct"=mean(dCt))
+head(qpcr_dCt_Wt_mean)
+
+```
+
+#### Ajouter les moyennes à la table principale
+
+```{r}
+qpcr_dCt_Wt_mean_combined<-qpcr_dCt|>merge(qpcr_dCt_Wt_mean,by="Gene")
+head(qpcr_dCt_Wt_mean_combined)
+```
+
+#### Calculer les 2ddCt
+
+```{r}
+qpcr_data_delta<-qpcr_dCt_Wt_mean_combined|>
+  mutate(ddCt= dCt-Mean_Ct,Foldchange=2^(-ddCt))
+head(qpcr_data_delta)
+```
+
+### boxplot
+
+avec les statistiques: legende: ns: p \> 0.05 : p \<= 0.05 : p \<= 0.01 : p \<= 0.001 \*\*\*\*: p \<= 0.0001
+
+indice: utiliser facet_wrap pour avoir un boxplot par gène et la focntion des gènes pour les couleurs
+
+```{r, fig.height = 10}
+ggplot(qpcr_data_delta,aes(x=CellType,y=Foldchange,fill=CellType))+
+  geom_boxplot()+facet_wrap(~Gene,scales="free",strip.position="right")+
+  stat_compare_means(method="t.test",label.y=max(qpcr_data_delta$Foldchange)*0.7)+
+  theme_classic2()
+```
+
+*Question 7: Quel est le gène édité dans votre jeu de donnée?*
+indice: c'est le Fold change le plus important
+
+```{r}
+qpcr_data_delta|>
+  filter(CellType=="KO")|>
+  arrange(desc(abs(ddCt)))|>
+  dplyr::select(Gene,Foldchange)|>
+  head()
+
+```
+*Question 8: Quel tissu est le plus affecté par la mutation?*
+Donner la réponse en ligne de code en filtrant les Fold change
+```{r}
+qpcr_data_delta|>filter(CellType=="KO")|>
+  group_by(Fonction)|>
+  summarise(Differentiel_moyenne=mean(abs(ddCt)))|>
+  arrange(desc(Differentiel_moyenne))
+
+```
+
+
+# Analyses des données de RNAseq
+## Création du DESeq dataset
+### Charger le tableau de count
+```{r}
+getwd()
+list.files()
+RNA_dat<-read.csv("RNAseq_countTable_new.csv",h=T,se=",",row.names = 1)
+head(RNA_dat)
+dim(RNA_dat)
+RNA_dat_mat<-as.matrix(RNA_dat)
+```
+
+### Charger les métadata
+```{r}
+samplecondition<-read.csv("GSE30352_All_SRAs.txt",sep="\t")
+head(samplecondition)
+```
+
+### Créer l'objet DESeq
+```{r, message = FALSE, warning=FALSE, error=FALSE}
+library(DESeq2)
+```
+
+```{r}
+dds<-DESeqDataSetFromMatrix(RNA_dat_mat,samplecondition,~source_name)
+dds
+```
+## Nettoyage des gènes avec peu de counts
+```{r}
+threshold<-3
+keep<-rowSums(counts(dds))>=threshold
+dds<-dds[keep,]
+dds
+```
+
+## Gène différentiellement exprimés
+```{r}
+dds$source_name<-factor(dds$source_name)
+dds<-DESeq(dds)
+```
+```{r}
+res<-results(object=dds,contrast = c("source_name","Kidney","Liver"))
+res
+```
+
+## Extraire les infos pour les DEGs
+### Résumé des résultats
+```{r}
+summary(res)
+```
+
+### Sortir les DEGs significatifs
+```{r}
+sum(res$padj<0.05,na.rm=T)
+```
+
+### Sauver les datas
+```{r}
+resOrdred<-res[order(res$"log2FoldChange",decreasing=T),]
+resOrdred
+write.csv(resOrdred,"Liver_vs_Kidney.csv")
+```
+
+## Visualistaion des datas
+### PCA
+```{r}
+vsd<-vst(dds,blind=T)
+plotPCA(vsd,intgroup="source_name",pcsToUse=1:2)
+```
+### MA plot
+```{r}
+DESeq2::plotMA(res)
+```
+
+### MA plot avec ggpubr
+```{r, height = 10}
+ggmaplot(res,size=2,main="DEGs Kidney vs Liver")
+```
+
+### Heatmap avec les DEGs
+```{r}
+resDDS<-cbind.data.frame(res$log2FoldChange,res$padj)
+rownames(resDDS)<-rownames(res)
+colnames(resDDS)<-c("log2FC","padj")
+head(resDDS)
+
+resSIG<-resDDS|>filter(padj<0.05)
+head(resSIG)
+dim(resSIG)
+```
+
+## Afficher le heatmap
+
+```{r}
+library(ComplexHeatmap)
+resSIGOrdered<-resSIG[order(abs(resSIG$log2FC),decreasing=T),]
+resSIGOrdered_top30<-resSIGOrdered[1:30,]
+
+RNA_dat<-as.data.frame(RNA_dat)
+
+RNA_dat_SIG<-RNA_dat|>
+  filter(row.names(RNA_dat)%in%row.names(resSIGOrdered_top30))
+
+colnames(RNA_dat_SIG)<-dds$source_name
+
+hm<-Heatmap(matrix=scale(RNA_dat_SIG),
+            cluster_rows=TRUE,
+            clustering_method_rows = "ward.D",
+            cluster_columns = TRUE,
+            clustering_method_columns = "ward.D",
+            show_row_names = TRUE,
+            show_column_names = TRUE)
+hm
+
+```
+
+
+```{r}
+hm<-Heatmap(matrix=scale(RNA_dat[1:100,]),
+            cluster_rows=TRUE,
+            clustering_method_rows = "ward.D2",
+            cluster_columns = TRUE,
+            clustering_method_columns = "ward.D2",
+            show_row_names = FALSE,
+            show_column_names = TRUE)
+hm
+```
+
+## Analyser les Gene Ontologies
+```{r}
+library(goseq)
+library(org.Mm.eg.db)
+library(clusterProfiler)
+#Plot les GO
+bg_genes<-rownames(res)
+
+#Choix des DEGs
+resSIG<-resDDS|>
+  filter(res$padj<0.05 & res$log2FoldChange>0)
+resSIG_symbol<-rownames(resSIG)
+
+#Calcul des gènes enrechis dans les ontologies
+enrich_go<-enrichGO(
+  gene=resSIG_symbol,
+  OrgDb = org.Mm.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  universe = bg_genes,
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+#Plot
+dotplot(enrich_go)
+
+keytypes(org.Mm.eg.db)
+
+```
+
+# Conclusion
+En résumé, l’analyse RT‑qPCR montre que la recombinaison Cre‑Lox entraîne des altérations marquées de l’expression de plusieurs gènes, avec un impact particulièrement prononcé sur les marqueurs *mésodermiques*. 
+Le calcul des variations d’expression indique que le gène *Mesp1* subit le plus fort différentiel d'expression, ce qui laisse penser qu’il s’agit très probablement du gène excisé dans ce modèle CRE-LOX. L’analyse en composantes principales révèle une séparation nette entre les échantillons WT et KO, attestant d’une recombinaison transcriptionnelle globale après la délétion. Les gènes liés à l’endoderme, à l’ectoderme et à la pluripotence présentent des changements plus modestes, suggérant que la perturbation cible principalement la voie mésodermique.
+Les analyses RNA‑seq montrent une distinction très marquée entre les tissus du Foie et du Rein. Le heatmap des 30 gènes les plus différentiellement exprimés révèle deux clusters séparés, reflétant la différentiation transcriptionnelle de chaque tissu. Les gènes surexprimés dans le foie (les plus nombreux) sont associés à des fonctions métaboliques essentielles (lipides, glucose, détoxification), tandis que ceux du rein sont liés au transport ionique, aux fonctions tubulaires et au stress oxydatif(gpx3).La gene ontolgogy corrobore la localisation mésodermique avec des counts importants dans le système renal et le developpement du rein. 
+En conclusion, nos données RT‑qPCR démontrent l’impact ciblé de la délétion Cre‑Lox sur la voie mésodermique, tandis que les données RNA‑seq et les analyses fonctionnelles valident la cohérence biologique des profils transcriptomiques entre tissus.
+Au total, ces résultats indiquent que la délétion induite par Cre‑Lox perturbe spécifiquement la régulation du mésoderme, avec Mesp1 comme acteur central susceptible d’affecter la différenciation embryonnaire surtout dans le *rein*.
